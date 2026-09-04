@@ -1,0 +1,5 @@
+# NUNCA subir secretos ni basura
+.env
+chat_id.txt
+__pycache__/
+*.pyc
