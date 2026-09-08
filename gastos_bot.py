@@ -16,6 +16,7 @@ NOTION_TOKEN    = os.getenv("NOTION_TOKEN", "").strip()
 NOTION_DB       = os.getenv("NOTION_DB_ID", "").strip()
 NOTION_KM_DB    = os.getenv("NOTION_KM_DB", "").strip()
 NOTION_FIJOS_DB = os.getenv("NOTION_FIJOS_DB", "").strip()
+NOTION_RECORD_DB = os.getenv("NOTION_RECORD_DB", "4292d8ee-4fff-4001-858f-f271760340bc").strip()
 SOLO_CHAT       = os.getenv("ALLOWED_CHAT_ID", "").strip()
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
@@ -73,6 +74,7 @@ MODO = {}          # chat_id -> "ingreso"|"gasto"
 PENDIENTE = {}     # chat_id -> estado conversacional
 RASTRO = {}        # chat_id -> [message_ids del flujo actual, para limpiar al terminar]
 CHAT_FILE = os.path.join(AQUI, "chat_id.txt")
+PIN_FILE = os.path.join(AQUI, "pin_id.txt")
 
 
 # ---------- utilidades ----------
@@ -420,7 +422,8 @@ def kb_tipo():
                  {"text": "🧾 Pagos", "callback_data": "T|gasto"}],
                 [{"text": "➕ Otro", "callback_data": "T|otro"}],
                 [{"text": "📅 Resumen", "callback_data": "T|resumen"},
-                 {"text": "📌 Pendientes", "callback_data": "P|ver"}]])
+                 {"text": "📌 Pendientes", "callback_data": "P|ver"}],
+                [{"text": "🔔 Recordatorios", "callback_data": "T|record"}]])
 
 
 def kb_resumen():
@@ -523,6 +526,10 @@ def menu(chat_id):
     MODO.pop(chat_id, None)
     limpiar(chat_id)
     responder(chat_id, "¿Qué vas a registrar? 👇", kb_tipo())
+    try:
+        fijar_resumen(chat_id)   # mantiene el mensaje fijado al día
+    except Exception as e:
+        print("pin menu err:", e)
 
 
 # ---------- Registros ----------
@@ -604,6 +611,8 @@ def _pagar(chat_id, f, monto, metodo=None):
     tipo = tipo_de(f["categoria"], "gasto")
     notion_crear(f["nombre"], monto, f["categoria"], metodo or f["metodo"] or None, tipo, notas=f["inmueble"] or None)
     notion_fijo_marcar_pagado(f["id"], mes_actual())
+    try: fijar_resumen(chat_id)
+    except Exception: pass
     pp = f.get("monto_pronto_pago") or 0
     ahorro = (f.get("monto") or 0) - monto
     extra = f"\n🎉 Pronto pago: ahorraste {fmt(ahorro)}." if (pp and monto == pp and ahorro > 0) else ""
@@ -640,6 +649,10 @@ def handle_callback(chat_id, data, mid):
         MODO.pop(chat_id, None); ed("➕ <b>Otro</b>", kb_otro()); return
     if data == "T|resumen":
         ed("📅 <b>Resumen</b> — ¿de qué periodo?", kb_resumen()); return
+    if data == "T|record":
+        try: ed(recordatorios_texto(), _kb([[{"text": "⬅️ Atrás", "callback_data": "T|inicio"}]]))
+        except Exception as e: ed(f"No pude leer recordatorios: {e}", _kb([[{"text": "⬅️ Atrás", "callback_data": "T|inicio"}]]))
+        return
     if data == "RSM|mes":
         try: ed(resumen_mes_texto(), kb_resumen())
         except Exception as e: ed(f"No pude armar el resumen: {e}", kb_resumen())
@@ -725,6 +738,12 @@ def manejar(chat_id, texto):
         return
     if low in ("/pendientes", "pendientes"):
         mostrar_pendientes(chat_id); return
+    if low in ("/recordatorios", "recordatorios"):
+        responder(chat_id, recordatorios_texto(), kb_fin()); return
+    if low.startswith("recordar") or low.startswith("/recordar"):
+        resto = t.split(None, 1)
+        registrar_recordatorio(chat_id, resto[1] if len(resto) > 1 else "")
+        return
 
     if chat_id in PENDIENTE:
         p = PENDIENTE[chat_id]
@@ -839,6 +858,148 @@ def cargar_chat():
         return None
 
 
+# ----- Recordatorios libres (Railway, renovaciones, etc.) -----
+def notion_recordatorio_crear(nombre, fecha_iso, nota=""):
+    props = {"Nombre": {"title": [{"text": {"content": nombre[:100]}}]},
+             "fecha": {"date": {"start": fecha_iso}}, "activo": {"checkbox": True}}
+    if nota:
+        props["nota"] = {"rich_text": [{"text": {"content": nota[:200]}}]}
+    r = requests.post(f"{NOTION_API}/pages", headers=NOTION_HEADERS,
+                      json={"parent": {"database_id": NOTION_RECORD_DB}, "properties": props}, timeout=20)
+    if r.status_code >= 300:
+        raise RuntimeError(f"Notion {r.status_code}: {r.text[:300]}")
+
+
+def notion_recordatorios_listar():
+    out, cursor = [], None
+    while True:
+        body = {"page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        r = requests.post(f"{NOTION_API}/databases/{NOTION_RECORD_DB}/query",
+                          headers=NOTION_HEADERS, json=body, timeout=20)
+        if r.status_code >= 300:
+            raise RuntimeError(f"Notion {r.status_code}: {r.text[:300]}")
+        d = r.json()
+        for pg in d.get("results", []):
+            pr = pg.get("properties", {})
+            tit = (pr.get("Nombre", {}) or {}).get("title") or []
+            fch = ((pr.get("fecha", {}) or {}).get("date") or {}).get("start")
+            act = (pr.get("activo", {}) or {}).get("checkbox", False)
+            if not fch or not act:
+                continue
+            f10 = fch[:10]
+            faltan = (dt.date.fromisoformat(f10) - dt.date.today()).days
+            out.append({"id": pg["id"], "nombre": tit[0]["plain_text"] if tit else "—",
+                        "fecha": f10, "faltan": faltan})
+        if not d.get("has_more"):
+            break
+        cursor = d.get("next_cursor")
+    return sorted(out, key=lambda x: x["faltan"])
+
+
+def registrar_recordatorio(chat_id, texto):
+    """recordar <nombre> <N|YYYY-MM-DD>  ->  crea recordatorio."""
+    partes = texto.split()
+    if len(partes) < 2:
+        responder(chat_id, "Formato: <code>recordar Railway 24</code> (en 24 días) o "
+                           "<code>recordar Railway 2026-10-02</code> (fecha)."); return
+    ultimo = partes[-1]
+    try:
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", ultimo):
+            fecha = dt.date.fromisoformat(ultimo)
+        else:
+            fecha = dt.date.today() + dt.timedelta(days=int(ultimo))
+    except ValueError:
+        responder(chat_id, "No entendí la fecha. Usa días (24) o AAAA-MM-DD."); return
+    nombre = " ".join(partes[:-1]).strip() or "Recordatorio"
+    notion_recordatorio_crear(nombre, fecha.isoformat())
+    faltan = (fecha - dt.date.today()).days
+    responder(chat_id, f"🔔 Recordatorio guardado: <b>{nombre}</b> · {fecha.strftime('%d/%m/%Y')} "
+                       f"(en {faltan} día(s)).", kb_fin())
+    fijar_resumen(chat_id)
+
+
+def recordatorios_texto():
+    try:
+        recs = [r for r in notion_recordatorios_listar() if r["faltan"] >= 0]
+    except Exception as e:
+        return f"No pude leer los recordatorios: {e}"
+    if not recs:
+        return ("🔔 <b>Recordatorios</b>\nNo tienes recordatorios.\n\n"
+                "<i>Agrega uno: <code>recordar Railway 24</code></i>")
+    lineas = [f"• <b>{r['nombre']}</b> — {dt.date.fromisoformat(r['fecha']).strftime('%d/%m')} "
+              f"(faltan {r['faltan']} día(s))" for r in recs]
+    return "🔔 <b>Recordatorios</b>\n" + "\n".join(lineas) + \
+           "\n\n<i>Agrega uno: <code>recordar Railway 24</code></i>"
+
+
+# ----- Mensaje fijado (siempre visible) -----
+def resumen_fijado_texto():
+    """Texto del mensaje que se fija: pagos por hacer + recordatorios próximos."""
+    partes = ["📌 <b>Por pagar / recordar</b>"]
+    try:
+        pend = pendientes_lista()
+        if pend:
+            partes.append("\n🧾 <b>Pagos fijos:</b>")
+            for f in pend:
+                partes.append(f"• {f['nombre']} — {fmt(f['monto']) if f['monto'] else 'variable'} · vence {int(f['dia'])}")
+    except Exception:
+        pass
+    try:
+        recs = [r for r in notion_recordatorios_listar() if 0 <= r["faltan"] <= 45]
+        if recs:
+            partes.append("\n🔔 <b>Recordatorios:</b>")
+            for r in recs:
+                partes.append(f"• {r['nombre']} — en {r['faltan']} día(s) ({dt.date.fromisoformat(r['fecha']).strftime('%d/%m')})")
+    except Exception:
+        pass
+    if len(partes) == 1:
+        partes.append("\n✅ Nada pendiente por ahora.")
+    return "\n".join(partes)
+
+
+def guardar_pin(mid):
+    try:
+        with open(PIN_FILE, "w") as fh:
+            fh.write(str(mid))
+    except OSError:
+        pass
+
+
+def cargar_pin():
+    try:
+        with open(PIN_FILE) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def fijar_resumen(chat_id):
+    """Envía/actualiza el mensaje fijado con lo que toca pagar/recordar."""
+    if not chat_id:
+        return
+    txt = resumen_fijado_texto()
+    pin = cargar_pin()
+    try:
+        if pin:
+            e = requests.post(f"{TG_API}/editMessageText", json={
+                "chat_id": chat_id, "message_id": int(pin), "text": txt,
+                "parse_mode": "HTML"}, timeout=20)
+            if e.ok:
+                return
+        m = requests.post(f"{TG_API}/sendMessage", json={
+            "chat_id": chat_id, "text": txt, "parse_mode": "HTML",
+            "disable_web_page_preview": True}, timeout=20).json()
+        mid = m.get("result", {}).get("message_id")
+        if mid:
+            requests.post(f"{TG_API}/pinChatMessage", json={
+                "chat_id": chat_id, "message_id": mid, "disable_notification": True}, timeout=20)
+            guardar_pin(mid)
+    except Exception as e:
+        print("fijar err:", e)
+
+
 def revisar_recordatorios(chat_id):
     if not chat_id:
         return
@@ -855,7 +1016,18 @@ def revisar_recordatorios(chat_id):
                     f"💵 {fmt(f['monto']) if f['monto'] else 'variable'} · págalo en 📄 Pagos fijos.",
                     track=False)
     except Exception as e:
-        print("recordatorio err:", e)
+        print("recordatorio fijos err:", e)
+    # Recordatorios libres: avisa al faltar 3, 1 o 0 días
+    try:
+        for r in notion_recordatorios_listar():
+            if r["faltan"] in (0, 1, 3):
+                cuando = "hoy" if r["faltan"] == 0 else f"en {r['faltan']} día(s)"
+                responder(chat_id, f"🔔 <b>{r['nombre']}</b> — {cuando} ({dt.date.fromisoformat(r['fecha']).strftime('%d/%m')}).",
+                          track=False)
+    except Exception as e:
+        print("recordatorio libres err:", e)
+    # Refresca el mensaje fijado
+    fijar_resumen(chat_id)
 
 
 # ---------- Main ----------
