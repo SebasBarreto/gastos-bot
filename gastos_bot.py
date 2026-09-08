@@ -576,6 +576,8 @@ def registrar_fijo(chat_id, texto):
     frec = FRECUENCIAS.get(partes[4].lower().strip(), "Mensual") if len(partes) > 4 else "Mensual"
     categoria = adivinar_categoria(nombre, "gasto")
     notion_fijo_crear(nombre, inmueble, categoria, monto or 0, int(dia or 1), frec, "")
+    try: fijar_resumen(chat_id)   # refresca el mensaje fijado con el nuevo fijo
+    except Exception: pass
     finalizar(chat_id,
         f"✅ Pago fijo guardado:\n<b>{nombre}</b>" + (f" · {inmueble}" if inmueble else "") + "\n"
         f"💵 {fmt(monto) if monto else 'variable'} · vence el <b>{int(dia or 1)}</b> · {frec}\n"
@@ -639,7 +641,8 @@ def pagar_fijo(chat_id, page_id, mid=None):
 # ---------- Callbacks ----------
 def handle_callback(chat_id, data, mid):
     ed = lambda txt, mk=None: editar(chat_id, mid, txt, mk)   # edita en el sitio (fluido)
-    if data == "T|inicio":
+    if data in ("T|inicio", "X|cancel"):
+        PENDIENTE.pop(chat_id, None); MODO.pop(chat_id, None)
         ed("¿Qué vas a registrar? 👇", kb_tipo()); return
     if data in ("T|ingreso", "T|gasto"):
         modo = data.split("|")[1]; MODO[chat_id] = modo
@@ -700,6 +703,7 @@ def handle_callback(chat_id, data, mid):
         PENDIENTE[chat_id] = {"nota_para": data.split("|", 1)[1]}
         ed("🗒️ Escribe la nota:"); return
     if data.startswith("B|"):
+        PENDIENTE.pop(chat_id, None)
         ed("Elige grupo:", kb_grupos(data.split("|")[1])); return
     if data.startswith("G|"):
         _, modo, gi = data.split("|"); gi = int(gi)
@@ -716,7 +720,9 @@ def handle_callback(chat_id, data, mid):
     if data.startswith("C|"):
         _, modo, cat = data.split("|", 2)
         PENDIENTE[chat_id] = {"categoria": cat, "modo": modo}
-        ed(f"Elegiste <b>{cat}</b>. Escribe: <b>monto [medio] [nota]</b>\nEj: <code>20000 efectivo nota</code>"); return
+        ed(f"Elegiste <b>{cat}</b>. Escribe: <b>monto [medio] [nota]</b>\nEj: <code>20000 efectivo nota</code>",
+           _kb([[{"text": "⬅️ Atrás", "callback_data": f"B|{modo}"}],
+                [{"text": "✖️ Cancelar", "callback_data": "X|cancel"}]])); return
 
 
 # ---------- Mensajes ----------
