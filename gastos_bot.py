@@ -38,13 +38,10 @@ GRUPOS = {
         ("🚕 DiDi / Uber (saldo)", ["__didi__"]),
     ],
     "gasto": [
-        ("🟠 Personal", ["Alimentación", "Mercado", "Hogar", "Cel", "Internet Casa", "Transporte",
-                         "Servicios", "Salud", "Compras personales", "Ocio", "Deudas", "Ahorro",
-                         "Inversión", "Otros"]),
-        ("🔵 Vehículo", ["Gasolina", "Gas", "Lavado", "Mantenimiento", "Llantas", "Aceite", "Repuestos",
-                         "Parqueadero", "Peajes", "Multas", "SOAT", "Tecnomecanica",
-                         "Comisión Uber", "Otros Uber"]),
-        ("🟣 Trading", ["Vps", "TradingView", "Software", "Prop Firms", "Brokers", "Educación", "Otros Trading"]),
+        ("🟠 Personal", ["Alimentación", "Mercado", "Paradas", "Ocio", "Servicios", "Salud", "Deudas", "Otros"]),
+        ("🔵 Vehículo", ["Gasolina", "Gas", "Lavado", "Parqueadero", "Peajes", "Multas"]),
+        ("🗓️ Vehículo (anual)", ["SOAT", "Tecnomecanica", "Llantas", "Aceite", "Mantenimiento", "Repuestos"]),
+        ("🟣 Trading", ["Vps", "TradingView", "Prop Firms", "Brokers", "Otros Trading"]),
         ("🤝 Préstamo dado", ["Préstamo dado"]),
     ],
 }
@@ -54,6 +51,7 @@ CAT_TRADING = {"Vps", "TradingView", "Software", "Prop Firms", "Brokers", "Otros
 CATEGORIAS = [
     ("Alimentación", ["almuerzo","comida","cena","desayuno","restaurante","cafe","café","domicilio"]),
     ("Mercado", ["mercado","ara","d1","exito","éxito"]),
+    ("Paradas", ["parada","chicle","agua","antojo","gaseosa","snack","mecato","dulce"]),
     ("Gas", [" gas ","gnv","glp"]),
     ("Gasolina", ["gasolina","combustible","tanqueada"]),
     ("Transporte", ["transporte","bus","taxi","pasaje"]),
@@ -284,6 +282,9 @@ def notion_fijos_listar():
                 "metodo": _rt(pr, "metodo"), "ultimo_pago": _rt(pr, "ultimo_pago"),
                 "frecuencia": ((pr.get("frecuencia", {}) or {}).get("select") or {}).get("name") or "Mensual",
                 "monto": (pr.get("monto", {}) or {}).get("number") or 0,
+                "monto_pronto_pago": (pr.get("monto_pronto_pago", {}) or {}).get("number") or 0,
+                "dia_limite_descuento": (pr.get("dia_limite_descuento", {}) or {}).get("number") or 0,
+                "estado_mes": ((pr.get("estado_mes", {}) or {}).get("select") or {}).get("name") or "",
                 "dia": (pr.get("dia", {}) or {}).get("number") or 1,
                 "activo": (pr.get("activo", {}) or {}).get("checkbox", False),
                 "notificar": (pr.get("notificar", {}) or {}).get("checkbox", True)})
@@ -309,9 +310,22 @@ def notion_fijo_crear(nombre, inmueble, categoria, monto, dia, frecuencia, metod
 
 def notion_fijo_marcar_pagado(page_id, mes):
     r = requests.patch(f"{NOTION_API}/pages/{page_id}", headers=NOTION_HEADERS,
-                       json={"properties": {"ultimo_pago": {"rich_text": [{"text": {"content": mes}}]}}}, timeout=20)
+                       json={"properties": {
+                           "ultimo_pago": {"rich_text": [{"text": {"content": mes}}]},
+                           "estado_mes": {"select": {"name": "Pagado"}}}}, timeout=20)
     if r.status_code >= 300:
         raise RuntimeError(f"Notion {r.status_code}: {r.text[:300]}")
+
+
+def monto_efectivo(f):
+    """Devuelve (monto, con_descuento). Si el fijo tiene pronto pago y hoy es
+    <= día límite, aplica el monto con descuento."""
+    normal = f.get("monto") or 0
+    pp = f.get("monto_pronto_pago") or 0
+    lim = f.get("dia_limite_descuento") or 0
+    if pp and lim and dt.datetime.now().day <= int(lim):
+        return pp, True
+    return normal, False
 
 
 def esta_pendiente(f):
@@ -335,6 +349,58 @@ def vencido(f):
 
 def pendientes_lista():
     return sorted([f for f in notion_fijos_listar() if esta_pendiente(f)], key=lambda f: f["dia"])
+
+
+# ---------- Resumen colorido del mes ----------
+CAT_EMOJI = {"Gasolina": "⛽", "Gas": "🔥", "Paradas": "🥤", "Alimentación": "🍔",
+             "Mercado": "🛒", "Ocio": "🎉", "Servicios": "🏠", "Deudas": "💳",
+             "Salud": "🩺", "Uber": "🚕", "Trading": "📈", "Lavado": "🧼",
+             "Parqueadero": "🅿️", "Peajes": "🛣️", "Multas": "🚨", "Otros": "➕"}
+
+
+def notion_gastos_mes():
+    """Suma los gastos (no ingresos/transferencias) del mes actual por categoría."""
+    ym = mes_actual()  # "YYYY-MM"
+    filtro = {"and": [
+        {"property": "fecha", "date": {"on_or_after": ym + "-01"}},
+        {"property": "tipo", "select": {"does_not_equal": "Ingreso"}},
+        {"property": "tipo", "select": {"does_not_equal": "Transferencia"}}]}
+    agg, total, cursor = {}, 0.0, None
+    while True:
+        body = {"page_size": 100, "filter": filtro}
+        if cursor:
+            body["start_cursor"] = cursor
+        r = requests.post(f"{NOTION_API}/databases/{NOTION_DB}/query",
+                          headers=NOTION_HEADERS, json=body, timeout=20)
+        if r.status_code >= 300:
+            raise RuntimeError(f"Notion {r.status_code}: {r.text[:300]}")
+        d = r.json()
+        for pg in d.get("results", []):
+            pr = pg.get("properties", {})
+            val = (pr.get("valor", {}) or {}).get("number") or 0
+            cat = ((pr.get("categoria", {}) or {}).get("select") or {}).get("name") or "Otros"
+            agg[cat] = agg.get(cat, 0) + val
+            total += val
+        if not d.get("has_more"):
+            break
+        cursor = d.get("next_cursor")
+    return total, agg
+
+
+def resumen_mes_texto():
+    total, agg = notion_gastos_mes()
+    if total <= 0:
+        return "📅 Aún no hay gastos registrados este mes."
+    filas = sorted(agg.items(), key=lambda x: -x[1])[:8]
+    lineas = []
+    for cat, val in filas:
+        pct = val / total * 100
+        barras = "█" * max(1, min(10, round(pct / 10)))
+        em = CAT_EMOJI.get(cat, "•")
+        lineas.append(f"{em} <b>{cat}</b>  {barras}  {fmt(val)} ({pct:.0f}%)")
+    return (f"📅 <b>Resumen de {mes_actual()}</b>\n"
+            f"💸 Total gastado: <b>{fmt(total)}</b>\n\n" + "\n".join(lineas) +
+            "\n\n<i>Escribe /pendientes para ver tus pagos fijos.</i>")
 
 
 # ---------- Telegram ----------
@@ -523,7 +589,10 @@ def _pagar(chat_id, f, monto, metodo=None):
     tipo = tipo_de(f["categoria"], "gasto")
     notion_crear(f["nombre"], monto, f["categoria"], metodo or f["metodo"] or None, tipo, notas=f["inmueble"] or None)
     notion_fijo_marcar_pagado(f["id"], mes_actual())
-    finalizar(chat_id, f"✅ Pagado: <b>{f['nombre']}</b> — {fmt(monto)}\nRegistrado en Movimientos. 📌\n\n¿Algo más? 👇")
+    pp = f.get("monto_pronto_pago") or 0
+    ahorro = (f.get("monto") or 0) - monto
+    extra = f"\n🎉 Pronto pago: ahorraste {fmt(ahorro)}." if (pp and monto == pp and ahorro > 0) else ""
+    finalizar(chat_id, f"🟢 Pagado: <b>{f['nombre']}</b> — {fmt(monto)}{extra}\nRegistrado en Movimientos. 📌\n\n¿Algo más? 👇")
 
 
 def pagar_fijo(chat_id, page_id, mid=None):
@@ -531,8 +600,11 @@ def pagar_fijo(chat_id, page_id, mid=None):
     if not f:
         _out(chat_id, mid, "No encontré ese pago fijo."); return
     PENDIENTE[chat_id] = {"pagar_fijo": page_id}
+    ef, desc = monto_efectivo(f)
     if f["monto"] and f["monto"] > 0:
-        _out(chat_id, mid, f"Pagar <b>{f['nombre']}</b> ({fmt(f['monto'])}). ¿Con qué medio?\n"
+        nota_desc = (f"\n🎉 <b>Pronto pago</b>: hoy pagas {fmt(ef)} (antes del día {int(f['dia_limite_descuento'])}), "
+                     f"en vez de {fmt(f['monto'])}.") if desc else ""
+        _out(chat_id, mid, f"Pagar <b>{f['nombre']}</b> ({fmt(ef)}).{nota_desc}\n¿Con qué medio?\n"
                            f"(efectivo, nequi, bancolombia, daviplata…)\n"
                            f"<i>Si el monto fue otro, escribe: monto medio</i>")
     else:
@@ -614,6 +686,14 @@ def manejar(chat_id, texto):
     t = texto.strip(); low = t.lower()
     if low in ("/start", "/menu", "menu", "hola", "inicio"):
         menu(chat_id); return
+    if low in ("/mes", "mes", "resumen", "/resumen"):
+        try:
+            responder(chat_id, resumen_mes_texto(), kb_fin())
+        except Exception as e:
+            responder(chat_id, f"No pude armar el resumen: {e}")
+        return
+    if low in ("/pendientes", "pendientes"):
+        mostrar_pendientes(chat_id); return
 
     if chat_id in PENDIENTE:
         p = PENDIENTE[chat_id]
@@ -668,8 +748,8 @@ def manejar(chat_id, texto):
             if not f:
                 responder(chat_id, "No encontré ese pago."); return
             monto, resto = parsear_monto(t)
-            if monto is None:            # no puso monto: usa el fijo; el texto es el medio
-                monto = f["monto"]
+            if monto is None:            # no puso monto: usa el fijo (con descuento si aplica)
+                monto, _desc = monto_efectivo(f)
                 metodo, _n = metodo_y_nota(t.split())
             else:
                 metodo, _n = metodo_y_nota(resto.split())
