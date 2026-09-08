@@ -358,11 +358,10 @@ CAT_EMOJI = {"Gasolina": "⛽", "Gas": "🔥", "Paradas": "🥤", "Alimentación
              "Parqueadero": "🅿️", "Peajes": "🛣️", "Multas": "🚨", "Otros": "➕"}
 
 
-def notion_gastos_mes():
-    """Suma los gastos (no ingresos/transferencias) del mes actual por categoría."""
-    ym = mes_actual()  # "YYYY-MM"
+def notion_gastos_desde(desde_iso):
+    """Suma los gastos (no ingresos/transferencias) desde una fecha por categoría."""
     filtro = {"and": [
-        {"property": "fecha", "date": {"on_or_after": ym + "-01"}},
+        {"property": "fecha", "date": {"on_or_after": desde_iso}},
         {"property": "tipo", "select": {"does_not_equal": "Ingreso"}},
         {"property": "tipo", "select": {"does_not_equal": "Transferencia"}}]}
     agg, total, cursor = {}, 0.0, None
@@ -387,10 +386,10 @@ def notion_gastos_mes():
     return total, agg
 
 
-def resumen_mes_texto():
-    total, agg = notion_gastos_mes()
+def _resumen_texto(desde_iso, titulo):
+    total, agg = notion_gastos_desde(desde_iso)
     if total <= 0:
-        return "📅 Aún no hay gastos registrados este mes."
+        return f"📅 Aún no hay gastos registrados en {titulo.lower()}."
     filas = sorted(agg.items(), key=lambda x: -x[1])[:8]
     lineas = []
     for cat, val in filas:
@@ -398,9 +397,17 @@ def resumen_mes_texto():
         barras = "█" * max(1, min(10, round(pct / 10)))
         em = CAT_EMOJI.get(cat, "•")
         lineas.append(f"{em} <b>{cat}</b>  {barras}  {fmt(val)} ({pct:.0f}%)")
-    return (f"📅 <b>Resumen de {mes_actual()}</b>\n"
-            f"💸 Total gastado: <b>{fmt(total)}</b>\n\n" + "\n".join(lineas) +
-            "\n\n<i>Escribe /pendientes para ver tus pagos fijos.</i>")
+    return (f"📅 <b>{titulo}</b>\n💸 Total gastado: <b>{fmt(total)}</b>\n\n" + "\n".join(lineas))
+
+
+def resumen_mes_texto():
+    return _resumen_texto(mes_actual() + "-01", f"Resumen del mes ({mes_actual()})")
+
+
+def resumen_semana_texto():
+    hoy = dt.date.today()
+    lunes = hoy - dt.timedelta(days=hoy.weekday())  # lunes de esta semana
+    return _resumen_texto(lunes.isoformat(), f"Resumen de la semana (desde {lunes.strftime('%d/%m')})")
 
 
 # ---------- Telegram ----------
@@ -411,7 +418,15 @@ def _kb(rows):
 def kb_tipo():
     return _kb([[{"text": "💰 Ingresos", "callback_data": "T|ingreso"},
                  {"text": "🧾 Pagos", "callback_data": "T|gasto"}],
-                [{"text": "➕ Otro", "callback_data": "T|otro"}]])
+                [{"text": "➕ Otro", "callback_data": "T|otro"}],
+                [{"text": "📅 Resumen", "callback_data": "T|resumen"},
+                 {"text": "📌 Pendientes", "callback_data": "P|ver"}]])
+
+
+def kb_resumen():
+    return _kb([[{"text": "📅 Mes", "callback_data": "RSM|mes"},
+                 {"text": "🗓️ Semana", "callback_data": "RSM|semana"}],
+                [{"text": "⬅️ Atrás", "callback_data": "T|inicio"}]])
 
 
 def kb_otro():
@@ -623,6 +638,16 @@ def handle_callback(chat_id, data, mid):
         ed(t, kb_grupos(modo)); return
     if data == "T|otro":
         MODO.pop(chat_id, None); ed("➕ <b>Otro</b>", kb_otro()); return
+    if data == "T|resumen":
+        ed("📅 <b>Resumen</b> — ¿de qué periodo?", kb_resumen()); return
+    if data == "RSM|mes":
+        try: ed(resumen_mes_texto(), kb_resumen())
+        except Exception as e: ed(f"No pude armar el resumen: {e}", kb_resumen())
+        return
+    if data == "RSM|semana":
+        try: ed(resumen_semana_texto(), kb_resumen())
+        except Exception as e: ed(f"No pude armar el resumen: {e}", kb_resumen())
+        return
     if data == "O|km":
         PENDIENTE[chat_id] = {"km": True}
         ed("🚗 Escribe: <b>odómetro combustible [costo]</b>\nEj: <code>45200 gas 30000</code>"); return
@@ -688,7 +713,13 @@ def manejar(chat_id, texto):
         menu(chat_id); return
     if low in ("/mes", "mes", "resumen", "/resumen"):
         try:
-            responder(chat_id, resumen_mes_texto(), kb_fin())
+            responder(chat_id, resumen_mes_texto(), kb_resumen())
+        except Exception as e:
+            responder(chat_id, f"No pude armar el resumen: {e}")
+        return
+    if low in ("/semana", "semana"):
+        try:
+            responder(chat_id, resumen_semana_texto(), kb_resumen())
         except Exception as e:
             responder(chat_id, f"No pude armar el resumen: {e}")
         return
