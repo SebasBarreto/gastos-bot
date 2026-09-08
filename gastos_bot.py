@@ -644,6 +644,10 @@ def handle_callback(chat_id, data, mid):
     if data in ("T|inicio", "X|cancel"):
         PENDIENTE.pop(chat_id, None); MODO.pop(chat_id, None)
         ed("¿Qué vas a registrar? 👇", kb_tipo()); return
+    if data == "PIN|refresh":
+        try: fijar_resumen(chat_id)   # actualiza el mensaje fijado en el sitio
+        except Exception as e: print("pin refresh err:", e)
+        return
     if data in ("T|ingreso", "T|gasto"):
         modo = data.split("|")[1]; MODO[chat_id] = modo
         t = "💰 <b>Ingresos</b> — elige grupo:" if modo == "ingreso" else "🧾 <b>Pagos</b> — elige grupo:"
@@ -988,6 +992,7 @@ def fijar_resumen(chat_id, forzar=False):
     if not chat_id:
         return
     txt = resumen_fijado_texto()
+    kb_pin = {"inline_keyboard": [[{"text": "🔄 Actualizar", "callback_data": "PIN|refresh"}]]}
     pin = cargar_pin()
     try:
         if forzar and pin:
@@ -1000,14 +1005,14 @@ def fijar_resumen(chat_id, forzar=False):
         if pin:
             e = requests.post(f"{TG_API}/editMessageText", json={
                 "chat_id": chat_id, "message_id": int(pin), "text": txt,
-                "parse_mode": "HTML"}, timeout=20)
-            if e.ok:
+                "parse_mode": "HTML", "reply_markup": kb_pin}, timeout=20)
+            if e.ok or "not modified" in e.text.lower():
                 requests.post(f"{TG_API}/pinChatMessage", json={
                     "chat_id": chat_id, "message_id": int(pin), "disable_notification": True}, timeout=20)
                 return
         m = requests.post(f"{TG_API}/sendMessage", json={
             "chat_id": chat_id, "text": txt, "parse_mode": "HTML",
-            "disable_web_page_preview": True}, timeout=20).json()
+            "disable_web_page_preview": True, "reply_markup": kb_pin}, timeout=20).json()
         mid = m.get("result", {}).get("message_id")
         if mid:
             requests.post(f"{TG_API}/pinChatMessage", json={
