@@ -388,10 +388,40 @@ def notion_gastos_desde(desde_iso):
     return total, agg
 
 
+def notion_ingresos_desde(desde_iso):
+    """Suma los ingresos (tipo = Ingreso) desde una fecha."""
+    filtro = {"and": [
+        {"property": "fecha", "date": {"on_or_after": desde_iso}},
+        {"property": "tipo", "select": {"equals": "Ingreso"}}]}
+    total, cursor = 0.0, None
+    while True:
+        body = {"page_size": 100, "filter": filtro}
+        if cursor:
+            body["start_cursor"] = cursor
+        r = requests.post(f"{NOTION_API}/databases/{NOTION_DB}/query",
+                          headers=NOTION_HEADERS, json=body, timeout=20)
+        if r.status_code >= 300:
+            raise RuntimeError(f"Notion {r.status_code}: {r.text[:300]}")
+        d = r.json()
+        for pg in d.get("results", []):
+            total += (pg.get("properties", {}).get("valor", {}) or {}).get("number") or 0
+        if not d.get("has_more"):
+            break
+        cursor = d.get("next_cursor")
+    return total
+
+
 def _resumen_texto(desde_iso, titulo):
     total, agg = notion_gastos_desde(desde_iso)
+    generado = notion_ingresos_desde(desde_iso)
+    neto = generado - total
+    signo = "🟢" if neto >= 0 else "🔴"
+    cabecera = (f"📅 <b>{titulo}</b>\n"
+                f"💰 Generado: <b>{fmt(generado)}</b>\n"
+                f"💸 Gastado: <b>{fmt(total)}</b>\n"
+                f"{signo} Neto: <b>{fmt(neto)}</b>")
     if total <= 0:
-        return f"📅 Aún no hay gastos registrados en {titulo.lower()}."
+        return cabecera + "\n\n<i>Sin gastos en el periodo.</i>"
     filas = sorted(agg.items(), key=lambda x: -x[1])[:8]
     lineas = []
     for cat, val in filas:
@@ -399,7 +429,7 @@ def _resumen_texto(desde_iso, titulo):
         barras = "█" * max(1, min(10, round(pct / 10)))
         em = CAT_EMOJI.get(cat, "•")
         lineas.append(f"{em} <b>{cat}</b>  {barras}  {fmt(val)} ({pct:.0f}%)")
-    return (f"📅 <b>{titulo}</b>\n💸 Total gastado: <b>{fmt(total)}</b>\n\n" + "\n".join(lineas))
+    return cabecera + "\n\n<b>Gastos por categoría:</b>\n" + "\n".join(lineas)
 
 
 def resumen_mes_texto():
