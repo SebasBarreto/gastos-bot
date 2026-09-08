@@ -527,7 +527,7 @@ def menu(chat_id):
     limpiar(chat_id)
     responder(chat_id, "¿Qué vas a registrar? 👇", kb_tipo())
     try:
-        fijar_resumen(chat_id)   # mantiene el mensaje fijado al día
+        fijar_resumen(chat_id, forzar=True)   # reaparece el fijado aunque vacíes el chat
     except Exception as e:
         print("pin menu err:", e)
 
@@ -536,7 +536,7 @@ def menu(chat_id):
 def registrar_con_categoria(chat_id, texto, categoria, modo):
     valor, resto = parsear_monto(texto)
     if valor is None:
-        responder(chat_id, "No leí el monto. Ej: <code>20000 efectivo papa</code>"); return False
+        responder(chat_id, "No leí el monto. Ej: <code>20000 efectivo nota</code>"); return False
     metodo, nota = metodo_y_nota(resto.split())
     tipo = tipo_de(categoria, modo)
     pid = notion_crear(nota or categoria, valor, categoria, metodo, tipo, notas=nota or None)
@@ -716,7 +716,7 @@ def handle_callback(chat_id, data, mid):
     if data.startswith("C|"):
         _, modo, cat = data.split("|", 2)
         PENDIENTE[chat_id] = {"categoria": cat, "modo": modo}
-        ed(f"Elegiste <b>{cat}</b>. Escribe: <b>monto [medio] [nota]</b>\nEj: <code>20000 efectivo papa</code>"); return
+        ed(f"Elegiste <b>{cat}</b>. Escribe: <b>monto [medio] [nota]</b>\nEj: <code>20000 efectivo nota</code>"); return
 
 
 # ---------- Mensajes ----------
@@ -975,18 +975,29 @@ def cargar_pin():
         return None
 
 
-def fijar_resumen(chat_id):
-    """Envía/actualiza el mensaje fijado con lo que toca pagar/recordar."""
+def fijar_resumen(chat_id, forzar=False):
+    """Envía/actualiza el mensaje fijado con lo que toca pagar/recordar.
+    forzar=True (p.ej. en /start): borra el fijado viejo y manda uno nuevo,
+    para que reaparezca aunque hayas vaciado el chat."""
     if not chat_id:
         return
     txt = resumen_fijado_texto()
     pin = cargar_pin()
     try:
+        if forzar and pin:
+            # Al vaciar el chat, editar el viejo no lo muestra; mejor uno nuevo.
+            requests.post(f"{TG_API}/unpinChatMessage",
+                          json={"chat_id": chat_id, "message_id": int(pin)}, timeout=20)
+            requests.post(f"{TG_API}/deleteMessage",
+                          json={"chat_id": chat_id, "message_id": int(pin)}, timeout=20)
+            pin = None
         if pin:
             e = requests.post(f"{TG_API}/editMessageText", json={
                 "chat_id": chat_id, "message_id": int(pin), "text": txt,
                 "parse_mode": "HTML"}, timeout=20)
             if e.ok:
+                requests.post(f"{TG_API}/pinChatMessage", json={
+                    "chat_id": chat_id, "message_id": int(pin), "disable_notification": True}, timeout=20)
                 return
         m = requests.post(f"{TG_API}/sendMessage", json={
             "chat_id": chat_id, "text": txt, "parse_mode": "HTML",
